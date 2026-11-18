@@ -1,0 +1,203 @@
+name: Build APK
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Auto-Detect & Build APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract & Detect Project Type
+        id: detect
+        run: |
+          mkdir -p workspace/extracted
+          unzip -oq source.zip -d workspace/extracted/
+          rm -rf workspace/extracted/__MACOSX
+
+          # Unwrap single top-level folder if user zipped a parent directory
+          cd workspace/extracted
+          ITEM_COUNT=$(ls -A | wc -l)
+          if [ "$ITEM_COUNT" -eq 1 ]; then
+            ONLY_ITEM=$(ls -A)
+            if [ -d "$ONLY_ITEM" ]; then
+              echo "Unwrapping single top-level folder: $ONLY_ITEM"
+              shopt -s dotglob nullglob
+              mv "$ONLY_ITEM"/* . 2>/dev/null || true
+              rmdir "$ONLY_ITEM" 2>/dev/null || true
+              shopt -u dotglob nullglob
+            fi
+          fi
+
+          # Detect project type
+          if [ -f "pubspec.yaml" ]; then
+            echo "Detected: Flutter project"
+            echo "type=flutter" >> $GITHUB_OUTPUT
+            echo "java_version=17" >> $GITHUB_OUTPUT
+            echo "proj_dir=workspace/extracted" >> $GITHUB_OUTPUT
+          elif find . -maxdepth 3 \( -name "gradlew" -o -name "build.gradle" -o -name "build.gradle.kts" \) -not -path "*/node_modules/*" | grep -q .; then
+            # Check if it's an existing Capacitor/Cordova/ReactNative JS root vs pure Native Android
+            if [ -f "package.json" ] && [ -d "android" ]; then
+              echo "Detected: Hybrid JS + Android project (Capacitor/RN)"
+              echo "type=hybrid_android" >> $GITHUB_OUTPUT
+              echo "java_version=17" >> $GITHUB_OUTPUT
+              echo "proj_dir=workspace/extracted" >> $GITHUB_OUTPUT
+            else
+              GRADLE_FILE=$(find . -maxdepth 3 \( -name "gradlew" -o -name "build.gradle" -o -name "build.gradle.kts" \) -not -path "*/node_modules/*" | head -n 1)
+              PROJ_SUB=$(dirname "$GRADLE_FILE")
+              echo "Detected: Native Android Gradle project at $PROJ_SUB"
+              echo "type=android" >> $GITHUB_OUTPUT
+              # Pick Java 17 for older Gradle (<8.5) or Java 21 for newer
+              JAVA_VER="17"
+              WRAPPER_PROPS=$(find . -maxdepth 4 -name "gradle-wrapper.properties" | head -n 1)
+              if [ -n "$WRAPPER_PROPS" ] && grep -qE "gradle-(8\.[5-9]|9\.)" "$WRAPPER_PROPS"; then
+                JAVA_VER="21"
+              fi
+              echo "java_version=$JAVA_VER" >> $GITHUB_OUTPUT
+              echo "proj_dir=workspace/extracted/$PROJ_SUB" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "Detected: Web / Node.js project (will wrap with Capacitor)"
+            echo "type=web" >> $GITHUB_OUTPUT
+            echo "java_version=21" >> $GITHUB_OUTPUT
+            echo "proj_dir=workspace/extracted" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ steps.detect.outputs.java_version }}
+
+      - name: Set up Node.js 22
+        if: steps.detect.outputs.type == 'web' || steps.detect.outputs.type == 'hybrid_android'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up Flutter
+        if: steps.detect.outputs.type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Build Flutter APK
+        if: steps.detect.outputs.type == 'flutter'
+        run: |
+          cd "${{ steps.detect.outputs.proj_dir }}"
+          flutter pub get
+          flutter build apk --debug
+          APK_PATH=$(find build/app/outputs -type f -name "*.apk" | head -n 1)
+          cp "$APK_PATH" "$GITHUB_WORKSPACE/app-debug.apk"
+
+      - name: Build Native Android APK
+        if: steps.detect.outputs.type == 'android'
+        run: |
+          cd "${{ steps.detect.outputs.proj_dir }}"
+          if [ -f "gradlew" ]; then
+            sed -i 's/\r$//' gradlew
+            chmod +x gradlew
+            ./gradlew assembleDebug --no-daemon
+          else
+            gradle assembleDebug --no-daemon
+          fi
+          APK_PATH=$(find . -type f -name "*.apk" ! -name "*androidTest*" ! -name "*unsigned*" | head -n 1)
+          if [ -z "$APK_PATH" ]; then
+            APK_PATH=$(find . -type f -name "*.apk" | head -n 1)
+          fi
+          if [ -z "$APK_PATH" ]; then
+            echo "Error: Build finished but no .apk file was generated."
+            exit 1
+          fi
+          cp "$APK_PATH" "$GITHUB_WORKSPACE/app-debug.apk"
+
+      - name: Build Hybrid JS + Android APK
+        if: steps.detect.outputs.type == 'hybrid_android'
+        run: |
+          cd "${{ steps.detect.outputs.proj_dir }}"
+          rm -rf node_modules
+          npm install --legacy-peer-deps
+          if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1)"; then
+            npm run build
+          fi
+          if npx cap --version >/dev/null 2>&1; then
+            npx cap sync android || true
+          fi
+          cd android
+          sed -i 's/\r$//' gradlew 2>/dev/null || true
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+          APK_PATH=$(find app/build/outputs -type f -name "*.apk" ! -name "*androidTest*" ! -name "*unsigned*" | head -n 1)
+          cp "$APK_PATH" "$GITHUB_WORKSPACE/app-debug.apk"
+
+      - name: Build Web App with Capacitor
+        if: steps.detect.outputs.type == 'web'
+        run: |
+          cd workspace/extracted
+          # If package.json exists, build modern JS framework (React/Vite/Vue/etc.)
+          if [ -f "package.json" ]; then
+            echo "package.json found. Installing dependencies..."
+            rm -rf node_modules
+            npm install --legacy-peer-deps
+            if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1)"; then
+              echo "Running npm run build..."
+              npm run build
+            fi
+          fi
+
+          # Locate built web directory
+          WEB_SRC=""
+          for DIR in dist build out www public; do
+            if [ -f "$DIR/index.html" ]; then
+              WEB_SRC="$DIR"
+              break
+            fi
+          done
+
+          if [ -z "$WEB_SRC" ]; then
+            INDEX_FILE=$(find . -type f -iname "index.html" -not -path "*/node_modules/*" -not -path "*/android/*" | head -n 1)
+            if [ -n "$INDEX_FILE" ]; then
+              WEB_SRC=$(dirname "$INDEX_FILE")
+            fi
+          fi
+
+          if [ -z "$WEB_SRC" ] || [ ! -f "$WEB_SRC/index.html" ]; then
+            echo "Error: No index.html found in the uploaded ZIP."
+            exit 1
+          fi
+
+          echo "Using web root: $WEB_SRC"
+          mkdir -p "$GITHUB_WORKSPACE/cap_build/web_app"
+          shopt -s dotglob nullglob
+          cp -r "$WEB_SRC"/* "$GITHUB_WORKSPACE/cap_build/web_app/"
+          shopt -u dotglob nullglob
+          rm -rf "$GITHUB_WORKSPACE/cap_build/web_app/node_modules"
+
+          cd "$GITHUB_WORKSPACE/cap_build"
+          npm init -y
+          npm install @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest
+          npx cap init 'apkfolder' 'com.builder.apkfolder' --web-dir "web_app"
+          npx cap add android
+          npx cap sync android
+
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+          APK_PATH=$(find app/build/outputs -type f -name "*.apk" ! -name "*androidTest*" ! -name "*unsigned*" | head -n 1)
+          cp "$APK_PATH" "$GITHUB_WORKSPACE/app-debug.apk"
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_id }}
+          name: APK Build ${{ github.run_number }}
+          files: app-debug.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
